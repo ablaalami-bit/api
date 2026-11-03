@@ -1,0 +1,65 @@
+// Mixpanel cohort webhook -> Intercom contact attributes
+// Deploy as a Vercel serverless function at /api/mp-cohort
+
+const INTERCOM = 'https://api.intercom.io'; // EU workspace: https://api.eu.intercom.io
+
+async function intercom(method, path, body) {
+  const r = await fetch(INTERCOM + path, {
+    method,
+    headers: {
+      Authorization: `Bearer ${process.env.INTERCOM_TOKEN}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'Intercom-Version': '2.11',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) throw Object.assign(new Error(await r.text()), { status: r.status });
+  return r.json();
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') return res.status(405).end();
+
+  // Check the Basic Auth credentials set on the Mixpanel webhook destination
+  const expected =
+    'Basic ' +
+    Buffer.from(`${process.env.WEBHOOK_USER}:${process.env.WEBHOOK_PASS}`).toString('base64');
+  if (req.headers.authorization !== expected) return res.status(401).end();
+
+  const { action, parameters = {}, members = [] } = req.body || {};
+  const pid = parameters.mixpanel_project_id;
+  const cohort = parameters.mixpanel_cohort_name;
+  const adding = action !== 'remove_members';
+
+  try {
+    for (const m of members) {
+      if (!m.email) continue; // match on email only
+
+      const found = await intercom('POST', '/contacts/search', {
+        query: { field: 'email', operator: '=', value: m.email },
+      });
+      const contact = found.data?.[0];
+      if (!contact) continue; // not in Intercom: skip
+
+      await intercom('PUT', `/contacts/${contact.id}`, {
+        custom_attributes: {
+          mixpanel_id: adding ? m.mixpanel_distinct_id : null,
+          mixpanel_profile_url: adding
+            ? `https://mixpanel.com/project/${pid}/view/${process.env.MP_VIEW_ID}/app/profile#distinct_id=${encodeURIComponent(m.mixpanel_distinct_id)}`
+            : null,
+          mixpanel_cohort: adding ? cohort : null,
+        },
+      });
+    }
+    return res.json({ action, status: 'success' });
+  } catch (e) {
+    // 5xx/429 = Mixpanel retries; 4xx would pause the sync
+    const code = e.status === 429 ? 429 : 500;
+    return res.status(code).json({
+      action,
+      status: 'failure',
+      error: { message: String(e.message).slice(0, 200), code },
+    });
+  }
+}
